@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +19,6 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/runtime/common.h"
-
-#include <utility>
-#include <vector>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using RequestIdType = tensorrt_llm::batch_manager::LlmRequest::RequestIdType;

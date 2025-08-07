@@ -128,7 +128,7 @@ else
   # If set, use the specified devices
   GPU_OPTS ?= --gpus='"device=$(NVIDIA_VISIBLE_DEVICES_VAL)"'
 endif
-SOURCE_DIR        ?= $(shell readlink -f ..)
+SOURCE_DIR        ?= $(shell readlink -f ../../)
 CODE_DIR          ?= /code/tensorrt_llm
 EXTRA_VOLUMES     ?=
 CCACHE_DIR        ?= $(CODE_DIR)/cpp/.ccache
@@ -160,7 +160,7 @@ endif
     		--workdir $(WORK_DIR) \
     		--hostname $(shell hostname)-$* \
     		--name $(CONTAINER_NAME)-$*-$(USER_NAME) \
-    		--tmpfs /tmp:exec \
+    		-v /run/udev:/run/udev:ro --cap-add=IPC_LOCK -v /tmp:/tmp \
     		$(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX) $(RUN_CMD)
 
 devel_%: STAGE = devel

@@ -424,3 +424,23 @@ def test_connector_multi_request(enforce_single_worker, model_with_connector):
 
     # The KV cache of both prior requests should be freed, allowing the third request to run.
     model.generate([2] * 110, sampling_params=sampling_params)
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_connector_multi_request_shared_prefix(enforce_single_worker,
+                                               model_with_connector):
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(disable_overlap_scheduler=True,
+                     kv_cache_config=KvCacheConfig(max_tokens=120))
+
+    sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+    scheduler.request_finished.return_value = True
+    worker.get_finished.side_effect = lambda finished_gen, load_async: (
+        finished_gen, load_async)
+
+    model.generate([[0] * 48, [0] * 48], sampling_params=sampling_params)
+
+    model.generate([1] * 110, sampling_params=sampling_params)

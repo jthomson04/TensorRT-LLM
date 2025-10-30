@@ -1995,6 +1995,8 @@ class PyExecutor:
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
+        self.resource_manager.free_resources(request)
+
         if self.kv_connector_manager is not None:
             # Only call request_finished on the connector if the request has already been added to the kv cache manager.
             try:
@@ -2012,8 +2014,6 @@ class PyExecutor:
                         request, True)
                     self.ctx_in_transmission_requests[request.py_request_id] = (
                         (request, block_id, self.ctx_in_transmission_counter))
-
-        self.resource_manager.free_resources(request)
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)

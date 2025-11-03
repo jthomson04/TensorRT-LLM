@@ -2009,25 +2009,53 @@ class PyExecutor:
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
-        self.resource_manager.free_resources(request)
-
         if self.kv_connector_manager is not None:
             # Only call request_finished on the connector if the request has already been added to the kv cache manager.
             try:
                 cache_block_ids = self.kv_cache_manager.get_cache_indices(
                     request)
             except IndexError:
+                logger.warning(
+                    "Request %s has not yet been added to the kv cache manager.",
+                    request.py_request_id)
                 # If the request has not yet been added to the kv cache manager,
                 # we still need to free resources corresponding to other resource managers.
                 self.resource_manager.free_resources(request)
             else:
-                if self.kv_connector_manager.request_finished(
-                        request,
-                        cache_block_ids) and not self.kv_cache_transceiver:
+                saving_async = self.kv_connector_manager.request_finished(
+                    request, cache_block_ids)
+
+                if saving_async and not self.kv_cache_transceiver:
+                    # If we're saving asynchronously and aren't doing disagg, we need to free all resources that aren't the kv cache manager.
+                    # Then, we pin the blocks for reuse.
+                    # When running with disagg, the kv cache transceiver logic handles this for us.
+                    for resource_mgr_type in (
+                            ResourceManagerType.SEQ_SLOT_MANAGER,
+                            ResourceManagerType.SPEC_RESOURCE_MANAGER):
+                        if resource_mgr_type in self.resource_manager.resource_managers and self.resource_manager.resource_managers[
+                                resource_mgr_type] is not None:
+                            self.resource_manager.resource_managers[
+                                resource_mgr_type].free_resources(request)
+
                     block_id = self.kv_cache_manager.store_blocks_for_reuse(
                         request, True)
                     self.ctx_in_transmission_requests[request.py_request_id] = (
                         (request, block_id, self.ctx_in_transmission_counter))
+                elif not saving_async and self.kv_cache_transceiver:
+                    # If not saving asynchronously and we're doing disagg, we need to decrement our counter, and maybe unpin the blocks.
+                    request, block_id, counter = self.ctx_in_transmission_requests.pop(
+                        request.py_request_id)
+                    if counter == 1:
+                        self.kv_cache_manager.unpin_blocks_by_id(block_id)
+                    else:
+                        self.ctx_in_transmission_requests[
+                            request.py_request_id] = (request, block_id,
+                                                      counter - 1)
+                elif not saving_async:
+                    # If not saving asynchronously and we're not doing disagg, we just free everything.
+                    self.resource_manager.free_resources(request)
+        else:
+            self.resource_manager.free_resources(request)
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)

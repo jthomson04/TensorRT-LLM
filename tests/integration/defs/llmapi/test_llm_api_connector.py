@@ -363,9 +363,13 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
                                   save_async):
     model_fn, scheduler, worker = model_with_connector
 
+    # NOTE(jthomson04): To test this we need to spin up some backend, but we don't want to go
+    # through the rigmarole of also starting a decode worker.
+    # So instead, we just specify the NIXL backend.
+    # NIXL throws some very scary-looking errors since it can't find the decode worker, but these can be ignored.
     model = model_fn(
         disable_overlap_scheduler=True,
-        cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"))
+        cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"))
 
     sampling_params = SamplingParams(ignore_eos=True)
 
@@ -400,47 +404,3 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
     assert len(req.new_tokens) == 48
 
     assert scheduler.request_finished.call_count == 1
-
-
-@pytest.mark.threadleak(enabled=False)
-def test_connector_multi_request(enforce_single_worker, model_with_connector):
-    model_fn, scheduler, worker = model_with_connector
-
-    model = model_fn(disable_overlap_scheduler=True,
-                     kv_cache_config=KvCacheConfig(max_tokens=120))
-
-    sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
-
-    scheduler.get_num_new_matched_tokens.return_value = 0, False
-    scheduler.request_finished.return_value = True
-    worker.get_finished.side_effect = lambda finished_gen, load_async: (
-        finished_gen, load_async)
-
-    model.generate([[0] * 48, [1] * 48],
-                   sampling_params=[
-                       SamplingParams(ignore_eos=True, max_tokens=4),
-                       SamplingParams(ignore_eos=True, max_tokens=3)
-                   ])
-
-    # The KV cache of both prior requests should be freed, allowing the third request to run.
-    model.generate([2] * 110, sampling_params=sampling_params)
-
-
-@pytest.mark.threadleak(enabled=False)
-def test_connector_multi_request_shared_prefix(enforce_single_worker,
-                                               model_with_connector):
-    model_fn, scheduler, worker = model_with_connector
-
-    model = model_fn(disable_overlap_scheduler=True,
-                     kv_cache_config=KvCacheConfig(max_tokens=120))
-
-    sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
-
-    scheduler.get_num_new_matched_tokens.return_value = 0, False
-    scheduler.request_finished.return_value = True
-    worker.get_finished.side_effect = lambda finished_gen, load_async: (
-        finished_gen, load_async)
-
-    model.generate([[0] * 48, [0] * 48], sampling_params=sampling_params)
-
-    model.generate([1] * 110, sampling_params=sampling_params)

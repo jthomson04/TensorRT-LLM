@@ -173,6 +173,11 @@ class KvCacheConnectorWorker(ABC):
         Additionally, the runtime will only take action based on these returned IDs once they've been returned by ALL workers. This allows some workers to take longer than others to complete the operations.
         """
 
+    @abstractmethod
+    def get_handshake_metadata(self) -> object:
+        """
+        Get handshake metadata for this worker, which gets sent to the leader.
+        """
 
 class KvCacheConnectorScheduler(ABC):
 
@@ -232,6 +237,12 @@ class KvCacheConnectorScheduler(ABC):
         Args:
             request: The request that was allocated resources.
             block_ids: The KV cacheblock IDs that were allocated.
+        """
+    
+    @abstractmethod
+    def set_handshake_metadata(self, metadata: dict[int, object]):
+        """
+        Provide the scheduler with the handshake metadata for the workers.
         """
 
 
@@ -553,6 +564,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             req.state = LlmRequestState.CONTEXT_INIT
             self.finished_async_loading_requests[id] = req
 
+        # TODO: Some call to update_connector_output here.
+
         # Return the requests that have finished saving.
         # The execution loop will call _terminate_request on these requests.
         return list(all_finished.saving.values())
@@ -570,3 +583,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def layer_post_hook(self, module, *args):
         self.worker.save_kv_layer(module.layer_idx, torch.cuda.current_stream())
+
+    def handle_handshake_metadata(self):
+        worker_metadata = self.worker.get_handshake_metadata()
+
+        all_metadata = mpi_allgather(worker_metadata)
+        
+        if mpi_rank() == 0:
+            all_metadata = {i: val for i, val in enumerate(all_metadata)}
+            self.scheduler.set_handshake_metadata(all_metadata)
+

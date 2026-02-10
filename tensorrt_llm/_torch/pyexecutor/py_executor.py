@@ -542,6 +542,12 @@ class PyExecutor:
             kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
             self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
+            # Register indexer K cache for DSA models
+            indexer_k_tensor = self.kv_cache_manager.get_indexer_k_cache_pool()
+            if indexer_k_tensor is not None:
+                self.kv_connector_manager.worker.register_indexer_k_cache(
+                    indexer_k_tensor)
+
             # For each of our layers, we need to register the pre/post hooks.
             # These are used for methods like `wait_for_layer_load` and `save_kv_layer`.
             for _name, module in self.model_engine.model.named_modules():

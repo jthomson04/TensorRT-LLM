@@ -123,6 +123,15 @@ class KvCacheConnectorWorker(ABC):
             kv_cache_tensor: The contiguous KV cache tensor.
         """
 
+    def register_indexer_k_cache(self, indexer_k_cache_tensor: torch.Tensor):
+        """
+        Register the indexer K cache tensor for DSA models.
+        Called after register_kv_caches when DSA is enabled.
+
+        Args:
+            indexer_k_cache_tensor: The contiguous indexer K cache tensor (FP8).
+        """
+
     @abstractmethod
     def start_load_kv(self, stream: torch.cuda.Stream):
         """

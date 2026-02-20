@@ -13,7 +13,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, mpi_rank, mpi_world_size
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           GuidedDecodingConfig, LoadFormat,
@@ -589,10 +589,24 @@ def create_py_executor(
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
             # To deal with cases like this, we instantiate them both concurrently.
+            # With attention DP, each rank is an independent DP domain and
+            # needs its own scheduler (no cross-rank MPI in the connector).
+            needs_scheduler = (scheduler_cls is not None
+                               and (rank == 0
+                                    or mapping.enable_attention_dp))
             with ThreadPoolExecutor(max_workers=2) as executor:
                 connector_worker_task = executor.submit(worker_cls, llm_args)
 
-                if scheduler_cls is not None and rank == 0:
+                # HACK: DO NOT MERGE THIS. THIS IS UGLY.
+                if mapping.enable_attention_dp:
+                    pub_port = 56001 + mpi_rank()
+                    ack_port = 56002 + mpi_world_size() + mpi_rank()
+
+                    logger.info(f"Setting DYN_KVBM_LEADER_ZMQ_PUB_PORT to {pub_port} and DYN_KVBM_LEADER_ZMQ_ACK_PORT to {ack_port} for MPI rank {mpi_rank()}")
+                    os.environ["DYN_KVBM_LEADER_ZMQ_PUB_PORT"] = str(pub_port)
+                    os.environ["DYN_KVBM_LEADER_ZMQ_ACK_PORT"] = str(ack_port)
+
+                if needs_scheduler:
                     connector_scheduler_task = executor.submit(
                         scheduler_cls, llm_args)
                     connector_scheduler = connector_scheduler_task.result()
@@ -608,7 +622,8 @@ def create_py_executor(
                     forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
-                connector_worker, connector_scheduler)
+                connector_worker, connector_scheduler,
+                enable_attention_dp=mapping.enable_attention_dp)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")

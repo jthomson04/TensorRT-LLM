@@ -397,14 +397,22 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     """
 
     def __init__(self, worker: KvCacheConnectorWorker,
-                 scheduler: Optional[KvCacheConnectorScheduler]):
-        assert (scheduler is not None) == (
-            mpi_rank() == 0), "The scheduler may only exist on rank 0!"
+                 scheduler: Optional[KvCacheConnectorScheduler],
+                 enable_attention_dp: bool = False):
+        if enable_attention_dp:
+            # With attention DP, each rank is an independent DP domain
+            # and needs its own scheduler.
+            assert scheduler is not None, \
+                "Each attention DP rank must have its own scheduler!"
+        else:
+            assert (scheduler is not None) == (
+                mpi_rank() == 0), "The scheduler may only exist on rank 0!"
 
         super().__init__()
 
         self.worker = worker
         self.scheduler = scheduler
+        self._enable_attention_dp = enable_attention_dp
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -424,7 +432,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def _run_on_leader(self, f: Callable[[], Any]) -> Any:
         """
         Run a function on the leader rank, and broadcast the result to all other ranks.
+
+        With attention DP, each rank is independent and has its own scheduler,
+        so no MPI communication is needed.
         """
+        if self._enable_attention_dp:
+            return f()
+
         if self.scheduler is not None:
             assert mpi_rank() == 0, "The scheduler may only exist on rank 0!"
             res = f()
@@ -555,17 +569,22 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.local_finished_async_requests.add_from(
             new_local_finished_async_requests)
 
-        # Broadcast this whole list to all other workers.
+        # Collect finished IDs from all workers and find the intersection
+        # (only release when ALL workers confirm completion).
         finished_saving = list(self.local_finished_async_requests.saving_ids)
         finished_loading = list(self.local_finished_async_requests.loading_ids)
 
-        all_results = mpi_allgather((finished_saving, finished_loading))
+        if self._enable_attention_dp:
+            # With attention DP, each rank is independent — use local results directly.
+            intersect_finished_saving = set(finished_saving)
+            intersect_finished_loading = set(finished_loading)
+        else:
+            all_results = mpi_allgather((finished_saving, finished_loading))
 
-        # Find only the requests that have been reported complete by all workers.
-        intersect_finished_saving = set.intersection(
-            *[set(res[0]) for res in all_results])
-        intersect_finished_loading = set.intersection(
-            *[set(res[1]) for res in all_results])
+            intersect_finished_saving = set.intersection(
+                *[set(res[0]) for res in all_results])
+            intersect_finished_loading = set.intersection(
+                *[set(res[1]) for res in all_results])
 
         # Remove these requests from our list of locally finished requests.
         all_finished = self.local_finished_async_requests.extract_by_id(

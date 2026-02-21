@@ -353,6 +353,11 @@ class KvCacheConnectorSchedulerOutputManager:
         for req in scheduled_batch.context_requests:
             if req.request_id in new_async_requests.loading_ids:
                 continue
+            # Skip attention DP dummy requests (request_id=0) injected by TensorRT-LLM
+            # to pad DP ranks with no active requests. They never go through _create_slot
+            # so they are not in inflight_requests.
+            if getattr(req, "is_attention_dp_dummy", False):
+                continue
 
             is_new = req.request_id not in self.requests
 
@@ -370,6 +375,8 @@ class KvCacheConnectorSchedulerOutputManager:
                 scheduler_output.cached_requests.append(request_data)
 
         for req in scheduled_batch.generation_requests:
+            if getattr(req, "is_attention_dp_dummy", False):
+                continue
             request_data = self.requests[req.request_id].update_and_build_data(
                 req, kv_cache_manager)
 
@@ -396,7 +403,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     When implementing a connector API, you do not need to implement this class.
     """
 
-    def __init__(self, worker: KvCacheConnectorWorker,
+    def __init__(self,
+                 worker: KvCacheConnectorWorker,
                  scheduler: Optional[KvCacheConnectorScheduler],
                  enable_attention_dp: bool = False):
         if enable_attention_dp:
@@ -478,6 +486,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def build_scheduler_output(self, scheduled_batch: ScheduledRequests,
                                kv_cache_manager: "KVCacheManager"):
+
         self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
             scheduled_batch, self.new_async_requests, kv_cache_manager)
 
@@ -528,6 +537,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             Whether the request is performing asynchronous saving operations. If true, we do not immediately call free_resources on the request.
         """
+
+        if req.is_attention_dp_dummy:
+            return False
 
         if req.request_id in self.finished_async_loading_requests:
             del self.finished_async_loading_requests[req.request_id]

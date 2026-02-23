@@ -2058,6 +2058,22 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
             mEvictionPolicy->releaseBlock(block);
         }
     }
+    // After the release loop, ensure non-leaf ancestors are behind their
+    // children in the queue. storeBlocks may have grafted a child onto a
+    // tree block that was already in the free queue from a prior request,
+    // leaving the parent ahead of the child. Moving it to the back
+    // guarantees children are evicted first.
+    for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend() - sequence.getNumFrontBlocksRemoved(); ++it)
+    {
+        auto parent = (*it)->getPrevBlock();
+        while (parent != nullptr && parent->getBlockId() != KVCacheBlock::kCachedBlocksRootId && !parent->isLeaf()
+            && !parent->hasRefs())
+        {
+            mEvictionPolicy->claimBlock(parent);
+            mEvictionPolicy->releaseBlock(parent);
+            parent = parent->getPrevBlock();
+        }
+    }
     // Remove stored block ids in sequence
     sequence.clearCacheBlocks(mWindowSize);
     return lastStoredId;

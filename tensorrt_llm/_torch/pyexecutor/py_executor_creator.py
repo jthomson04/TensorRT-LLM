@@ -601,10 +601,12 @@ def create_py_executor(
                 if mapping.enable_attention_dp:
                     pub_port = 56001 + mpi_rank()
                     ack_port = 56002 + mpi_world_size() + mpi_rank()
+                    trtllm_port = 20081 + mpi_rank()
 
-                    logger.info(f"Setting DYN_KVBM_LEADER_ZMQ_PUB_PORT to {pub_port} and DYN_KVBM_LEADER_ZMQ_ACK_PORT to {ack_port} for MPI rank {mpi_rank()}")
+                    logger.info(f"Setting DYN_KVBM_LEADER_ZMQ_PUB_PORT to {pub_port}, DYN_KVBM_LEADER_ZMQ_ACK_PORT to {ack_port}, DYN_KVBM_TRTLLM_ZMQ_PORT to {trtllm_port} for MPI rank {mpi_rank()}")
                     os.environ["DYN_KVBM_LEADER_ZMQ_PUB_PORT"] = str(pub_port)
                     os.environ["DYN_KVBM_LEADER_ZMQ_ACK_PORT"] = str(ack_port)
+                    os.environ["DYN_KVBM_TRTLLM_ZMQ_PORT"] = str(trtllm_port)
 
                 if needs_scheduler:
                     connector_scheduler_task = executor.submit(

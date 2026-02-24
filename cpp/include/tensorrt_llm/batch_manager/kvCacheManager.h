@@ -862,9 +862,9 @@ public:
     //! \return Pair of (num blocks stored for reuse, vector of pinned block IDs).
     [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
         std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
-        bool pinBlocks = false);
+        bool pinBlocks = false, GenerationRequest* sequence = nullptr, SizeType32 beamIdx = 0);
 
-    [[nodiscard]] bool verifyQueueIntegrity();
+    [[nodiscard]] bool verifyQueueIntegrity() const;
 
     // Only needed when sliding window attention + paged context fmha are used together.
     // In that case, a temporary kv cache buffer with maximum chunk size (maxNumTokens) is needed.
@@ -1146,7 +1146,7 @@ public:
         return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds, pinBlocks);
     }
 
-    [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize);
+    [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize) const;
 
     void releasePools();
 

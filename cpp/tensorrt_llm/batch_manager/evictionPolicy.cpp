@@ -99,6 +99,34 @@ bool LRUEvictionPolicy::verifyQueueIntegrity()
             }
         }
     }
+
+    TLLM_LOG_INFO("Free queues:");
+    for (SizeType32 cacheLevel = 0; cacheLevel < kNumCacheLevels; cacheLevel++)
+    {
+        for (SizeType32 level = 0; level < kMaxPriority - kMinPriority + 1; level++)
+        {
+            if (!mFreeQueues[cacheLevel][level].empty())
+            {
+                std::ostringstream oss;
+                oss << "Block IDs at cacheLevel " << cacheLevel << ", priorityLevel " << level << ": [";
+                bool first = true;
+                for (auto const& block : mFreeQueues[cacheLevel][level])
+                {
+                    if (!first)
+                    {
+                        oss << ", ";
+                    }
+                    oss << block->getBlockId();
+                    first = false;
+                }
+                oss << "]";
+                TLLM_LOG_INFO("%s", oss.str().c_str());
+                
+            }
+        }
+
+    }
+
     TLLM_LOG_DEBUG("LRUEvictionPolicy queues are %s", queueCompromised ? "compromised" : "not compromised");
     return !queueCompromised;
 }

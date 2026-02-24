@@ -830,7 +830,8 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
         auto blockedUniqueTokens
             = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), false);
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-        (void) mWindowBlockManagers.at(windowSize).storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        (void) mWindowBlockManagers.at(windowSize).storeBlocks(
+            std::move(blockKeys), cacheBlockIds[beamIdx], false, &sequence, beamIdx);
     }
 }
 
@@ -1584,7 +1585,8 @@ void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAm
 }
 
 std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::storeBlocks(
-    std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds, bool pinBlocks)
+    std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds, bool pinBlocks,
+    GenerationRequest* sequence, SizeType32 beamIdx)
 {
     SizeType32 numBlocksStoredForReuse = 0;
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
@@ -1625,8 +1627,36 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 TLLM_LOG_DEBUG("%s::storeBlocks - Found matching block %d, traverse", mLogPrefix.c_str(),
                     matchedBlock->getBlockId());
                 searchRoot = matchedBlock;
-                // TODO possible optimization: if bid != matchedBlock->getBlockId(),
-                // block can be freed and inserted at mFreePrimaryBlocks.begin()
+                // Swap the sequence's duplicate block for the tree block so that
+                // the tree block gains a ref from this sequence (protecting it
+                // from eviction) and the duplicate is freed immediately.
+                if (sequence != nullptr && bid != matchedBlock->getBlockId())
+                {
+                    auto& duplicateBlock = mAllBlocksById.at(bid);
+                    // Claim tree block from eviction queue (no-op if not queued)
+                    mEvictionPolicy->claimBlock(matchedBlock);
+                    matchedBlock->incRefCount();
+                    // Release duplicate
+                    duplicateBlock->decRefCount();
+                    if (!duplicateBlock->hasRefs())
+                    {
+                        mEvictionPolicy->releaseBlock(duplicateBlock, true);
+                    }
+                    // Replace in allocated blocks
+                    auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(sequence->getRequestId());
+                    for (auto& ab : allocatedBlocks)
+                    {
+                        if (ab->getBlockId() == bid)
+                        {
+                            ab = matchedBlock;
+                            break;
+                        }
+                    }
+                    sequence->changeCacheBlock(
+                        mWindowSize, beamIdx, static_cast<SizeType32>(blockCnt), matchedBlock->getBlockId());
+                    TLLM_LOG_DEBUG("%s::storeBlocks - Swapped duplicate block %d for tree block %d",
+                        mLogPrefix.c_str(), bid, matchedBlock->getBlockId());
+                }
             }
             else
             {
@@ -1897,7 +1927,7 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     {
         // store all blocks
         TLLM_LOG_DEBUG("%s::storeNewBlock - store all blocks", mLogPrefix.c_str());
-        (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], false, &sequence, beamIdx);
         return;
     }
 
@@ -1908,7 +1938,7 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     if (prevBlock->getPrevBlock() == nullptr)
     {
         TLLM_LOG_DEBUG("%s::storeNewBlock - store all blocks", mLogPrefix.c_str());
-        (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], false, &sequence, beamIdx);
         return;
     }
 
@@ -1919,7 +1949,7 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
         return;
     }
     TLLM_LOG_DEBUG("%s::storeNewBlock - store the last block", mLogPrefix.c_str());
-    (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+    (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], false, &sequence, beamIdx);
 }
 
 std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
@@ -1995,6 +2025,22 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         if (!block->hasRefs())
         {
             mEvictionPolicy->releaseBlock(block);
+        }
+    }
+    // After the release loop, ensure non-leaf ancestors are behind their
+    // children in the queue. storeBlocks may have grafted a child onto a
+    // tree block that was already in the free queue from a prior request,
+    // leaving the parent ahead of the child. Moving it to the back
+    // guarantees children are evicted first.
+    for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend() - sequence.getNumFrontBlocksRemoved(); ++it)
+    {
+        auto parent = (*it)->getPrevBlock();
+        while (parent != nullptr && parent->getBlockId() != KVCacheBlock::kCachedBlocksRootId && !parent->isLeaf()
+            && !parent->hasRefs())
+        {
+            mEvictionPolicy->claimBlock(parent);
+            mEvictionPolicy->releaseBlock(parent);
+            parent = parent->getPrevBlock();
         }
     }
     // Remove stored block ids in sequence

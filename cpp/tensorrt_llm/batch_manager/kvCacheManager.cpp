@@ -1281,7 +1281,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                             *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
                     }
                     matchingBlock->setHash();
-                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Copied partially filled block %d", mLogPrefix.c_str(),
+                    TLLM_LOG_INFO("%s::loadOrAllocateBlocks - Copied partially filled block %d", mLogPrefix.c_str(),
                         matchingBlockId);
                 }
                 else
@@ -1298,6 +1298,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             else
             {
                 // Recover block and reuse
+                TLLM_LOG_INFO("KV CACHE MANAGER: Reusing block %d for request %lu", matchingBlockId, sequence.getRequestId());
                 mEvictionPolicy->claimBlock(
                     matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
                 TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
@@ -1316,6 +1317,33 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
         }
         else
         {
+            // Log why the match failed at this position
+            if (matchingBlock != nullptr)
+            {
+                TLLM_LOG_WARNING(
+                    "%s::loadOrAllocateBlocks - MISS at bi=%d: prepopulatedPromptLen gate rejected match. "
+                    "numMatchedTokens=%d, numMatched=%d, getCurrentPrepopulatedPromptLen=%d",
+                    mLogPrefix.c_str(), bi, numMatchedTokens, numMatched,
+                    sequence.getCurrentPrepopulatedPromptLen());
+            }
+            else if (searchRoot == nullptr)
+            {
+                TLLM_LOG_WARNING(
+                    "%s::loadOrAllocateBlocks - MISS at bi=%d: searchRoot is null (prior block was partial/miss)",
+                    mLogPrefix.c_str(), bi);
+            }
+            else
+            {
+                TLLM_LOG_WARNING(
+                    "%s::loadOrAllocateBlocks - MISS at bi=%d: findMatchingBlock returned null. "
+                    "searchRoot block=%d isLeaf=%d, numMatchedTokens=%d, blockKey tokens[0]=%d",
+                    mLogPrefix.c_str(), bi, searchRoot->getBlockId(),
+                    static_cast<int>(searchRoot->isLeaf()),
+                    numMatchedTokens,
+                    blockItr != blockKeys.end() && !blockItr->uniqueTokens.empty()
+                        ? blockItr->uniqueTokens.front().tokenId
+                        : -1);
+            }
             // If we haven't set a priority, set it to the default priority level (low)
             auto freeBlock = getFreeBlock(sequence,
                 perBlockRetentions[bi].retentionPriority.value_or(
@@ -1626,7 +1654,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             if (matchedBlock != nullptr)
             {
                 // Found match
-                TLLM_LOG_DEBUG("%s::storeBlocks - Found matching block %d, traverse", mLogPrefix.c_str(),
+                TLLM_LOG_INFO("%s::storeBlocks - Found matching block %d, traverse", mLogPrefix.c_str(),
                     matchedBlock->getBlockId());
                 searchRoot = matchedBlock;
                 // Swap the sequence's duplicate block for the tree block so that
@@ -1656,14 +1684,14 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                     }
                     sequence->changeCacheBlock(
                         mWindowSize, beamIdx, static_cast<SizeType32>(blockCnt), matchedBlock->getBlockId());
-                    TLLM_LOG_DEBUG("%s::storeBlocks - Swapped duplicate block %d for tree block %d",
+                    TLLM_LOG_INFO("%s::storeBlocks - Swapped duplicate block %d for tree block %d",
                         mLogPrefix.c_str(), bid, matchedBlock->getBlockId());
                 }
             }
             else
             {
                 // No match
-                TLLM_LOG_DEBUG("%s::storeBlocks - No match, inserting block %d into search structure",
+                TLLM_LOG_INFO("%s::storeBlocks - No match, inserting block %d into search structure",
                     mLogPrefix.c_str(), block->getBlockId());
                 TLLM_CHECK_WITH_INFO(block->getBlockId() == bid,
                     "Block id mismatch " + std::to_string(block->getBlockId()) + " != " + std::to_string(bid));

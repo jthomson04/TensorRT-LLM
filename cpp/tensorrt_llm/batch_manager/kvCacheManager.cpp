@@ -803,12 +803,12 @@ WindowBlockManager::~WindowBlockManager()
         100.0 * mReusedTokens / mTotalInputTokens);
 }
 
-bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize)
+bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize) const
 {
     return mWindowBlockManagers.at(windowSize).verifyQueueIntegrity();
 }
 
-bool WindowBlockManager::verifyQueueIntegrity()
+bool WindowBlockManager::verifyQueueIntegrity() const
 {
     return mEvictionPolicy->verifyQueueIntegrity();
 }
@@ -1450,6 +1450,8 @@ void WindowBlockManager::addSequence(
         = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, perBlockRetentions, mode, directory);
     mReusedTokens += static_cast<double>(prepopulatedPromptLen);
     mTotalInputTokens += static_cast<double>(uniqueTokens.size());
+
+    TLLM_LOG_INFO("Request %d: %d tokens, %d tokens on gpu.", llmRequest.mRequestId, uniqueTokens.size(), prepopulatedPromptLen);
 
     SizeType32 numConnectorMatchedTokens = 0;
 

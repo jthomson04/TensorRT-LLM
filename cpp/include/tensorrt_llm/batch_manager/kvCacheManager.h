@@ -266,6 +266,10 @@ public:
 
     void decSchedulingRefCount();
 
+    //! \brief Test if block is detached from radix search tree.
+    //! \return True if block is detached from search tree.
+    [[nodiscard]] bool isDetached() const;
+
     [[nodiscard]] bool hasRefs() const;
 
     [[nodiscard]] bool hasSchedulingRefs() const;
@@ -864,7 +868,7 @@ public:
         std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
         bool pinBlocks = false);
 
-    [[nodiscard]] bool verifyQueueIntegrity();
+    [[nodiscard]] bool verifyQueueIntegrity() const;
 
     // Only needed when sliding window attention + paged context fmha are used together.
     // In that case, a temporary kv cache buffer with maximum chunk size (maxNumTokens) is needed.
@@ -1146,7 +1150,7 @@ public:
         return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds, pinBlocks);
     }
 
-    [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize);
+    [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize) const;
 
     void releasePools();
 

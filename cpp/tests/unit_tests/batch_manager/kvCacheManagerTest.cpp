@@ -3049,6 +3049,86 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 0);
 }
 
+// Verifies that non-leaf blocks do not end up in the eviction queue.
+// When two concurrent requests share a prefix and complete at different times,
+// storeBlocks can graft a child onto a tree block that is already in the free
+// queue, violating the leaf-only invariant.
+TEST_F(KVCacheManagerTest, NonLeafBlockInEvictionQueueTest)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numHeads = 2;
+    auto constexpr sizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr sinkTokenLength = 0;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr maxSequenceLength = 128;
+    auto constexpr maxAttentionWindow = 128;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr onboardBlocks = true;
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
+        nvinfer1::DataType::kHALF, sinkTokenLength, stream, maxSequenceLength,
+        /*enableBlockReuse=*/true, onboardBlocks);
+    kvCacheManager.allocatePools(false);
+
+    auto const onlyWindowSize = theOnlyWindowSize(kvCacheManager);
+    auto const& blockManager = kvCacheManager.getBlockManager();
+
+    auto constexpr beamWidth = maxBeamWidth;
+    SizeType32 constexpr maxNewTokens = 1;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    // Request Y: tokens [1000..1007] → 2 blocks: Y0=[1000..1003], Y1=[1004..1007]
+    auto inputTokensY = std::make_shared<VecTokens>(VecTokens{1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007});
+    auto llmRequestY = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokensY, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(0, static_cast<SizeType32>(inputTokensY->size()), beamWidth, llmRequestY);
+
+    // Request X: same first block, different second block
+    // tokens [1000..1003, 2000..2003] → 2 blocks: X0=[1000..1003], X1=[2000..2003]
+    // Y has not been stored yet, so X gets fresh blocks (no tree match).
+    auto inputTokensX = std::make_shared<VecTokens>(VecTokens{1000, 1001, 1002, 1003, 2000, 2001, 2002, 2003});
+    auto llmRequestX = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokensX, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(1, static_cast<SizeType32>(inputTokensX->size()), beamWidth, llmRequestX);
+
+    kvCacheManager.storeContextBlocks(*llmRequestY);
+    kvCacheManager.storeContextBlocks(*llmRequestX);
+
+    blockManager.verifyQueueIntegrity(onlyWindowSize);
+
+    (void) kvCacheManager.removeSequence(0, llmRequestY);
+
+    blockManager.verifyQueueIntegrity(onlyWindowSize);
+
+    (void) kvCacheManager.removeSequence(1, llmRequestX);
+
+    blockManager.verifyQueueIntegrity(onlyWindowSize);
+
+    ASSERT_EQ(blockManager.getNumFreeBlocks(), 4);
+
+    auto inputTokensZ = std::make_shared<VecTokens>(VecTokens{42, 42, 42, 42, 42, 42, 42, 42, 42});
+    auto llmRequestZ = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokensZ, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(2, static_cast<SizeType32>(inputTokensZ->size()), beamWidth, llmRequestZ);
+    kvCacheManager.storeContextBlocks(*llmRequestZ);
+    (void) kvCacheManager.removeSequence(2, llmRequestZ);
+
+    ASSERT_EQ(blockManager.getNumFreeBlocks(), 4);
+
+    blockManager.verifyQueueIntegrity(onlyWindowSize);
+
+    auto inputTokensTest = std::make_shared<VecTokens>(VecTokens{1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008});
+    auto llmRequestTest = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokensTest, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(3, static_cast<SizeType32>(inputTokensTest->size()), beamWidth, llmRequestTest);
+
+    ASSERT_EQ(llmRequestTest->getContextCurrentPosition(), 4);
+}
+
 TEST_P(KVCacheManagerTest, KVCacheManagerRewindTokensTest)
 {
     using DType = half;

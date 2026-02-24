@@ -803,12 +803,17 @@ WindowBlockManager::~WindowBlockManager()
         100.0 * mReusedTokens / mTotalInputTokens);
 }
 
-bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize)
+bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize) const
 {
     return mWindowBlockManagers.at(windowSize).verifyQueueIntegrity();
 }
 
-bool WindowBlockManager::verifyQueueIntegrity()
+bool KVCacheBlock::isDetached() const
+{
+    return mPrevBlock == nullptr && mNextBlocks.empty();
+}
+
+bool WindowBlockManager::verifyQueueIntegrity() const
 {
     return mEvictionPolicy->verifyQueueIntegrity();
 }
@@ -1994,7 +1999,10 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         // If ref count is zero, move block to free blocks
         if (!block->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(block);
+            // Send block to front of free queue if it has no reusable state
+            // This means it will be evicted first
+            auto const toFront = block->isDetached();
+            mEvictionPolicy->releaseBlock(block, toFront);
         }
     }
     // Remove stored block ids in sequence

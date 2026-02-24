@@ -3049,10 +3049,6 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 0);
 }
 
-// Verifies that non-leaf blocks do not end up in the eviction queue.
-// When two concurrent requests share a prefix and complete at different times,
-// storeBlocks can graft a child onto a tree block that is already in the free
-// queue, violating the leaf-only invariant.
 TEST_F(KVCacheManagerTest, NonLeafBlockInEvictionQueueTest)
 {
     auto constexpr numLayers = 2;

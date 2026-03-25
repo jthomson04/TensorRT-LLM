@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,9 +44,9 @@ import torch
 
 from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
 from tensorrt_llm.bindings import LlmRequestState
-from tensorrt_llm.bindings.internal.batch_manager import \
-    KvCacheConnectorManager as KvCacheConnectorManagerCpp
-from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
+from tensorrt_llm.bindings.internal.batch_manager import (
+    KvCacheConnectorManager as KvCacheConnectorManagerCpp, LlmRequest,
+    get_stored_block_hashes)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from .llm_request import get_draft_token_length
@@ -65,6 +65,10 @@ class RequestData:
     new_tokens: List[int]
     # The new block IDs allocated in the prior forward pass.
     new_block_ids: List[int]
+    # The hashes of fully-computed blocks currently storable for this request.
+    # These match KVCacheStoredBlockData.block_hash values for blocks available
+    # at the current computed_position, and do not include the in-progress tail.
+    block_hashes: List[int]
     # The position of the latest token with computed (valid) kv cache values.
     computed_position: int
     # The number of scheduled tokens for the upcoming forward pass.
@@ -317,6 +321,11 @@ class KvCacheConnectorSchedulerOutputRequest:
             num_scheduled_tokens = 1 + get_draft_token_length(
                 req)  # Specdec with draft tokens is not supported yet.
 
+        all_block_hashes = get_stored_block_hashes(req,
+                                                   kv_cache_manager.tokens_per_block)
+        num_stored_blocks = computed_position // kv_cache_manager.tokens_per_block
+        block_hashes = all_block_hashes[:num_stored_blocks]
+
         # Get retention priority for each new block only if retention config is provided
         # (for priority-based offload filtering)
         priorities = None
@@ -327,7 +336,8 @@ class KvCacheConnectorSchedulerOutputRequest:
             ]
 
         return RequestData(req.request_id, new_tokens, new_block_ids,
-                           computed_position, num_scheduled_tokens, priorities)
+                           block_hashes, computed_position,
+                           num_scheduled_tokens, priorities)
 
 
 class KvCacheConnectorSchedulerOutputManager:

@@ -9,6 +9,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
+from tensorrt_llm.bindings.internal.batch_manager import get_stored_block_hashes
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -105,6 +106,30 @@ def test_kv_cache_event_data_serialization():
     flush_events(kv_cache_manager)
     events = kv_cache_manager.get_latest_events(10)
     serialized_event = KVCacheEventSerializer.serialize(events)
+
+
+def test_get_stored_block_hashes_match_event_block_hashes():
+    kv_cache_manager = create_kv_cache_manager()
+    flush_events(kv_cache_manager)
+
+    req = create_llm_request(0, [1, 2, 3, 4, 5])
+    expected_hashes = get_stored_block_hashes(req,
+                                              kv_cache_manager.tokens_per_block)
+
+    kv_cache_manager.impl.add_sequence(req.py_request_id, req.prompt_len, 1,
+                                       req)
+    kv_cache_manager.free_resources(req)
+
+    flush_events(kv_cache_manager)
+    events = kv_cache_manager.get_latest_events(10)
+    stored_events = [
+        event for event in events
+        if type(event.data).__name__ == "KVCacheStoredData"
+    ]
+
+    assert len(stored_events) == 1
+    assert [block.block_hash
+            for block in stored_events[0].data.blocks] == expected_hashes
 
 
 def test_mm_keys_serialization():

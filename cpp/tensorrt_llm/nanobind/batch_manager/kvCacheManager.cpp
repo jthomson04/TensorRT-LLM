@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -63,6 +63,28 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
         return tr::TorchView::of(torchPtr.value());
     }
     return std::nullopt;
+}
+
+std::vector<std::size_t> getStoredBlockHashes(
+    tb::LlmRequest const& llmRequest, SizeType32 tokensPerBlock)
+{
+    auto const& uniqueTokens = llmRequest.getUniqueTokens(/*beam=*/0);
+    auto const usableSize = static_cast<SizeType32>(uniqueTokens.size());
+    auto blockedUniqueTokens = tbk::chopVectorIntoBlocks<tr::UniqueToken>(
+        uniqueTokens, usableSize, tokensPerBlock, /*allowPartial=*/false);
+    auto blockKeys = tbk::buildBlockKeys(blockedUniqueTokens, llmRequest);
+
+    std::vector<std::size_t> blockHashes;
+    blockHashes.reserve(blockKeys.size());
+
+    std::size_t parentHash = 0;
+    for (auto const& blockKey : blockKeys)
+    {
+        parentHash = tbk::BlockKeyHasher::hash(blockKey, parentHash);
+        blockHashes.push_back(parentHash);
+    }
+
+    return blockHashes;
 }
 
 class PyKvCacheManager : public tbk::BaseKVCacheManager
@@ -342,6 +364,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
 
     nb::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
         .def_static("hash", &tbk::BlockKeyHasher::hash, nb::arg("block_key"), nb::arg("parent_hash") = 0);
+
+    m.def("get_stored_block_hashes", &getStoredBlockHashes, nb::arg("llm_request"),
+        nb::arg("tokens_per_block"));
 
     nb::class_<tbk::KVCacheEventManager>(m, "KVCacheEventManager")
         .def(nb::init<size_t, std::optional<SizeType32>, std::optional<SizeType32>, SizeType32>(),

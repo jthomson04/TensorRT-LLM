@@ -262,14 +262,19 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
             assert len(request.new_tokens) == NUM_INPUT_TOKENS
             assert len(request.new_block_ids) == math.ceil(NUM_INPUT_TOKENS /
                                                            BLOCK_SIZE)
+            assert request.block_hashes == []
             assert request.computed_position == 0
             assert request.num_scheduled_tokens == NUM_INPUT_TOKENS
         elif i == 1 and use_overlap_scheduler:
             assert len(sched_output.new_requests) == 0
             assert len(sched_output.cached_requests) == 1
 
-            assert len(sched_output.cached_requests[0].new_tokens) == 0
-            assert sched_output.cached_requests[0].num_scheduled_tokens == 1
+            request = sched_output.cached_requests[0]
+
+            assert len(request.new_tokens) == 0
+            assert len(request.block_hashes) == (request.computed_position //
+                                                 BLOCK_SIZE)
+            assert request.num_scheduled_tokens == 1
         else:
             assert len(sched_output.cached_requests) == 1
             assert len(sched_output.new_requests) == 0
@@ -283,6 +288,8 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
             else:
                 assert request.new_block_ids == []
 
+            assert len(request.block_hashes) == (request.computed_position //
+                                                 BLOCK_SIZE)
             assert request.num_scheduled_tokens == 1
 
     scheduler.build_connector_meta.reset_mock()

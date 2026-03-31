@@ -341,6 +341,62 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.attention_dp_events_gather_period_ms == 10
 
 
+def test_KvCacheConfig_tp_mla_replicated_host_offload_is_pure_python_field():
+    config = KvCacheConfig(
+        host_cache_size=1024,
+        enable_partial_reuse=False,
+        enable_tp_mla_replicated_host_offload=True,
+    )
+
+    pybind_config = config._to_pybind()
+    assert config.enable_tp_mla_replicated_host_offload == True
+    assert not hasattr(pybind_config,
+                       "enable_tp_mla_replicated_host_offload")
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected_error",
+    [
+        ({
+            "host_cache_size": 1024,
+            "enable_tp_mla_replicated_host_offload": True,
+        }, "enable_partial_reuse=True"),
+        ({
+            "host_cache_size": 1024,
+            "enable_partial_reuse": False,
+            "enable_tp_mla_replicated_host_offload": True,
+            "use_kv_cache_manager_v2": True,
+        }, "use_kv_cache_manager_v2=False"),
+        ({
+            "enable_partial_reuse": False,
+            "enable_tp_mla_replicated_host_offload": True,
+        }, "host_cache_size > 0"),
+        ({
+            "host_cache_size": 1024,
+            "enable_partial_reuse": False,
+            "enable_tp_mla_replicated_host_offload": True,
+            "onboard_blocks": False,
+        }, "onboard_blocks=True"),
+    ],
+)
+def test_KvCacheConfig_tp_mla_replicated_host_offload_validation(
+        kwargs, expected_error):
+    with pytest.raises(ValidationError, match=expected_error):
+        KvCacheConfig(**kwargs)
+
+
+def test_TrtLlmArgs_rejects_tp_mla_replicated_host_offload():
+    with pytest.raises(ValidationError, match="PyTorch backend"):
+        TrtLlmArgs(
+            model=llama_model_path,
+            kv_cache_config=KvCacheConfig(
+                host_cache_size=1024,
+                enable_partial_reuse=False,
+                enable_tp_mla_replicated_host_offload=True,
+            ),
+        )
+
+
 def test_CapacitySchedulerPolicy():
     val = CapacitySchedulerPolicy.MAX_UTILIZATION
     assert PybindMirror.maybe_to_pybind(

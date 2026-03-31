@@ -3168,6 +3168,40 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_mpi_world_size(8)
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(140000)
+    def test_tp_mla_replicated_host_cache_offload(self):
+        """Validate replicated host offloading for plain-TP MLA."""
+        if get_sm_version() == 100 or get_sm_version() == 103:
+            moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
+        else:
+            moe_config = MoeConfig()
+
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.4,
+            host_cache_size=10 * (1 << 30),
+            enable_partial_reuse=False,
+            enable_tp_mla_replicated_host_offload=True,
+        )
+
+        with LLM(
+                self.MODEL_PATH,
+                max_batch_size=1,
+                tensor_parallel_size=8,
+                pipeline_parallel_size=1,
+                moe_expert_parallel_size=8,
+                kv_cache_config=kv_cache_config,
+                disable_overlap_scheduler=False,
+                cuda_graph_config=CudaGraphConfig(),
+                moe_config=moe_config,
+                enable_attention_dp=False,
+                sparse_attention_config=DeepSeekSparseAttentionConfig(
+                    skip_indexer_for_short_seqs=False),
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,attention_dp,max_batch_size,moe_backend,fp8kv,chunked_prefill",

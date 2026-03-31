@@ -4,7 +4,7 @@ import subprocess
 import sys
 import unittest
 from typing import NamedTuple, Tuple
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -859,6 +859,139 @@ class TestResourceManager(unittest.TestCase):
                             "KVCacheManager should not use the default stream")
 
         kv_cache_manager.shutdown()
+
+    def test_kv_cache_manager_passes_tp_mla_replicated_host_offload_kwargs(
+            self):
+
+        class MockPretrainedConfig:
+            kv_lora_rank = 128
+            qk_rope_head_dim = 64
+
+        class MockRuntimeModelConfig:
+            pretrained_config = MockPretrainedConfig()
+
+        mapping = Mapping(world_size=2, rank=0, tp_size=2)
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.1,
+            host_cache_size=1024,
+            enable_partial_reuse=False,
+            enable_tp_mla_replicated_host_offload=True,
+        )
+        execution_stream = type("ExecutionStream", (),
+                                {"cuda_stream": 1234})()
+
+        mock_impl = MagicMock()
+        mock_impl.get_block_pool_pointers.return_value = torch.zeros((1, 2),
+                                                                     dtype=torch.int64)
+        mock_impl.get_block_scale_pool_pointers.return_value = torch.empty(
+            0, dtype=torch.int64)
+        mock_impl.get_layer_to_pool_mapping.return_value = torch.zeros(
+            (1, 2), dtype=torch.int32)
+        mock_impl.num_pools = 1
+        mock_impl.max_blocks_per_seq = 1
+
+        with patch('torch.cuda.mem_get_info',
+                   return_value=(128 * 1024 * 1024, 256 * 1024 * 1024)):
+            with patch(
+                    'tensorrt_llm._torch.pyexecutor.resource_manager.KVCacheManagerCpp',
+                    return_value=mock_impl) as mock_ctor:
+                kv_cache_manager = KVCacheManager(
+                    kv_cache_config=kv_cache_config,
+                    kv_cache_type=tensorrt_llm.bindings.internal.
+                    batch_manager.CacheType.SELF,
+                    num_layers=2,
+                    num_kv_heads=2,
+                    head_dim=128,
+                    tokens_per_block=64,
+                    max_seq_len=1024,
+                    max_batch_size=1,
+                    mapping=mapping,
+                    model_config=MockRuntimeModelConfig(),
+                    execution_stream=execution_stream,
+                )
+
+        ctor_kwargs = mock_ctor.call_args.kwargs
+        self.assertTrue(
+            ctor_kwargs['enable_tp_mla_replicated_host_offload'])
+        self.assertEqual(ctor_kwargs['tp_group_ranks'], mapping.tp_group)
+        kv_cache_manager.shutdown()
+
+    def test_kv_cache_manager_rejects_tp_mla_replicated_host_offload_with_attention_dp(
+            self):
+
+        class MockPretrainedConfig:
+            kv_lora_rank = 128
+            qk_rope_head_dim = 64
+
+        class MockRuntimeModelConfig:
+            pretrained_config = MockPretrainedConfig()
+
+        mapping = Mapping(world_size=2,
+                          rank=0,
+                          tp_size=2,
+                          enable_attention_dp=True)
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.1,
+            host_cache_size=1024,
+            enable_partial_reuse=False,
+            enable_tp_mla_replicated_host_offload=True,
+        )
+
+        with patch('torch.cuda.mem_get_info',
+                   return_value=(128 * 1024 * 1024, 256 * 1024 * 1024)):
+            with self.assertRaisesRegex(
+                    ValueError, "enable_attention_dp=False"):
+                KVCacheManager(
+                    kv_cache_config=kv_cache_config,
+                    kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+                    CacheType.SELF,
+                    num_layers=2,
+                    num_kv_heads=2,
+                    head_dim=128,
+                    tokens_per_block=64,
+                    max_seq_len=1024,
+                    max_batch_size=1,
+                    mapping=mapping,
+                    model_config=MockRuntimeModelConfig(),
+                    execution_stream=type("ExecutionStream", (),
+                                          {"cuda_stream": 1234})(),
+                )
+
+    def test_kv_cache_manager_rejects_tp_mla_replicated_host_offload_for_non_mla(
+            self):
+
+        class MockPretrainedConfig:
+            hidden_size = 1024
+
+        class MockRuntimeModelConfig:
+            pretrained_config = MockPretrainedConfig()
+
+        mapping = Mapping(world_size=2, rank=0, tp_size=2)
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.1,
+            host_cache_size=1024,
+            enable_partial_reuse=False,
+            enable_tp_mla_replicated_host_offload=True,
+        )
+
+        with patch('torch.cuda.mem_get_info',
+                   return_value=(128 * 1024 * 1024, 256 * 1024 * 1024)):
+            with self.assertRaisesRegex(ValueError, "only supported for MLA"):
+                KVCacheManager(
+                    kv_cache_config=kv_cache_config,
+                    kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+                    CacheType.SELF,
+                    num_layers=2,
+                    num_kv_heads=2,
+                    head_dim=128,
+                    tokens_per_block=64,
+                    max_seq_len=1024,
+                    max_batch_size=1,
+                    mapping=mapping,
+                    model_config=MockRuntimeModelConfig(),
+                    execution_stream=type("ExecutionStream", (),
+                                          {"cuda_stream": 1234})(),
+                )
 
     def test_peft_cache_manager_with_execution_stream(self):
         """Test that PeftCacheManager uses the provided execution_stream.

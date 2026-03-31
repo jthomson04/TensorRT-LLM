@@ -495,6 +495,32 @@ class KVCacheManager(BaseResourceManager):
         self._stream = execution_stream if execution_stream is not None else torch.cuda.Stream(
         )
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
+        enable_tp_mla_replicated_host_offload = (
+            kv_cache_config.enable_tp_mla_replicated_host_offload)
+        if enable_tp_mla_replicated_host_offload:
+            if model_config is None:
+                raise ValueError(
+                    "enable_tp_mla_replicated_host_offload requires model_config"
+                )
+            if mapping.enable_attention_dp:
+                raise ValueError(
+                    "enable_tp_mla_replicated_host_offload is only supported with "
+                    "enable_attention_dp=False"
+                )
+            if mapping.tp_size <= 1:
+                raise ValueError(
+                    "enable_tp_mla_replicated_host_offload requires tensor_parallel_size > 1"
+                )
+            pretrained_config = getattr(model_config, "pretrained_config", None)
+            if pretrained_config is None:
+                raise ValueError(
+                    "enable_tp_mla_replicated_host_offload requires a model_config with pretrained_config"
+                )
+            if not hasattr(pretrained_config, "kv_lora_rank"):
+                raise ValueError(
+                    "enable_tp_mla_replicated_host_offload is only supported for MLA models"
+                )
+
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -513,6 +539,10 @@ class KVCacheManager(BaseResourceManager):
             'cache_type': kv_cache_type,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
+            'enable_tp_mla_replicated_host_offload':
+            enable_tp_mla_replicated_host_offload,
+            'tp_group_ranks': mapping.tp_group
+            if enable_tp_mla_replicated_host_offload else [],
             'kv_connector_manager': self.kv_connector_manager,
             'enable_indexer_k_cache': enable_indexer_k_cache,
             'indexer_k_cache_quant_block_size':

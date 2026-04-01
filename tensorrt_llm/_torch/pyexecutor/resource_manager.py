@@ -498,10 +498,6 @@ class KVCacheManager(BaseResourceManager):
         enable_tp_mla_replicated_host_offload = (
             kv_cache_config.enable_tp_mla_replicated_host_offload)
         if enable_tp_mla_replicated_host_offload:
-            if model_config is None:
-                raise ValueError(
-                    "enable_tp_mla_replicated_host_offload requires model_config"
-                )
             if mapping.enable_attention_dp:
                 raise ValueError(
                     "enable_tp_mla_replicated_host_offload is only supported with "
@@ -511,12 +507,7 @@ class KVCacheManager(BaseResourceManager):
                 raise ValueError(
                     "enable_tp_mla_replicated_host_offload requires tensor_parallel_size > 1"
                 )
-            pretrained_config = getattr(model_config, "pretrained_config", None)
-            if pretrained_config is None:
-                raise ValueError(
-                    "enable_tp_mla_replicated_host_offload requires a model_config with pretrained_config"
-                )
-            if not hasattr(pretrained_config, "kv_lora_rank"):
+            if kv_cache_type != CacheTypeCpp.SELFKONLY:
                 raise ValueError(
                     "enable_tp_mla_replicated_host_offload is only supported for MLA models"
                 )

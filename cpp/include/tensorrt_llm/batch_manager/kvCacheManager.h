@@ -953,6 +953,15 @@ private:
     //! \brief Calls KVCacheBlock::freeLeafBlock to remove block from search tree.
     void freeLeafBlock(BlockPtr const& block);
 
+    //! \brief Prepare a replicated-MLA onboard before the batched NCCL flush.
+    [[nodiscard]] BlockPtr prepareReplicatedMlaOnboard(GenerationRequest& sequence,
+        BlockPtr const& offloadBlock, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
+        std::string const& directory = "");
+
+    //! \brief Flush a batch of replicated-MLA onboards in one NCCL group.
+    void flushReplicatedMlaOnboardBatch(std::vector<BlockPtr> const& batch,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM);
+
     //! \brief For FP4 quantization. Creates pool objects for FP4 block scalars.
     void createBlockScalePools(SizeType32 blockSize);
 
@@ -1038,6 +1047,9 @@ private:
     std::set<int> mTpGroupRanks;
     // Leader world rank for replicated host offload.
     int mTpLeaderRank;
+    // Statistics for replicated MLA onboard batching.
+    size_t mReplicatedMlaOnboardedBlocks;
+    size_t mReplicatedMlaOnboardGroups;
     // The kv cache connector manager
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
 

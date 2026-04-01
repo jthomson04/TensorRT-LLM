@@ -54,6 +54,8 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 namespace
 {
 
+constexpr size_t kReplicatedMlaOnboardBatchSize{8U};
+
 //! \brief Get all blocks in a sequence by traversing backwards from the last block.
 //! \param lastBlock is a BlockPtr to the last block in the sequence to start traversal from
 //! \return Vector of BlockPtr-s in sequence order
@@ -117,23 +119,33 @@ void validateReplicatedHostOffloadMode(tle::KvCacheTransferMode mode)
 }
 
 #if ENABLE_MULTI_DEVICE
-void broadcastPrimaryBlockToTpGroup(BufferManager const& bufferManager, BlockPtr const& block,
+void broadcastPrimaryBlocksToTpGroup(BufferManager const& bufferManager, std::vector<BlockPtr> const& blocks,
     std::vector<KVCacheBlockPool> const& pools, std::set<int> const& tpGroupRanks)
 {
+    if (blocks.empty())
+    {
+        return;
+    }
     TLLM_CHECK_WITH_INFO(tpGroupRanks.size() > 1, "Replicated TP MLA host offload requires tp_size > 1");
     auto ncclComm = ::tensorrt_llm::getComm(tpGroupRanks);
     auto* dtypeMap = ::tensorrt_llm::getDtypeMap();
     auto const stream = bufferManager.getStream().get();
 
     NCCLCHECK_THROW(ncclGroupStart());
-    for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
+    for (auto const& block : blocks)
     {
-        auto blockPtr = getBlockPoolPointer(block, pools, poolIdx);
-        auto const dtype = blockPtr->getDataType();
-        auto const dtypeIt = dtypeMap->find(dtype);
-        TLLM_CHECK_WITH_INFO(dtypeIt != dtypeMap->end(), "Unsupported NCCL broadcast dtype %d", static_cast<int>(dtype));
-        NCCLCHECK_THROW(ncclBroadcast(
-            blockPtr->data(), blockPtr->data(), blockPtr->getSize(), dtypeIt->second, 0, *ncclComm, stream));
+        TLLM_CHECK_WITH_INFO(
+            block->isPrimary(), "Replicated TP MLA host offload can only broadcast primary blocks");
+        for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
+        {
+            auto blockPtr = getBlockPoolPointer(block, pools, poolIdx);
+            auto const dtype = blockPtr->getDataType();
+            auto const dtypeIt = dtypeMap->find(dtype);
+            TLLM_CHECK_WITH_INFO(
+                dtypeIt != dtypeMap->end(), "Unsupported NCCL broadcast dtype %d", static_cast<int>(dtype));
+            NCCLCHECK_THROW(ncclBroadcast(
+                blockPtr->data(), blockPtr->data(), blockPtr->getSize(), dtypeIt->second, 0, *ncclComm, stream));
+        }
     }
     NCCLCHECK_THROW(ncclGroupEnd());
 }
@@ -734,6 +746,8 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mEnableTpMlaReplicatedHostOffload{enableTpMlaReplicatedHostOffload}
     , mIsTpLeader{!enableTpMlaReplicatedHostOffload}
     , mTpLeaderRank{-1}
+    , mReplicatedMlaOnboardedBlocks{0}
+    , mReplicatedMlaOnboardGroups{0}
     , mKvCacheConnectorManager{std::move(kvCacheConnectorManager)}
     , mEnableIndexerKCache{enableIndexerKCache}
     , mIndexerKCacheQuantBlockSize{indexerKCacheQuantBlockSize}
@@ -856,6 +870,16 @@ WindowBlockManager::~WindowBlockManager()
     TLLM_LOG_DEBUG("%s - reused tokens:                       %.0f ", mLogPrefix.c_str(), mReusedTokens);
     TLLM_LOG_DEBUG("%s - reused tokens percentage (%%):        %.2f ", mLogPrefix.c_str(),
         100.0 * mReusedTokens / mTotalInputTokens);
+    if (mReplicatedMlaOnboardGroups > 0)
+    {
+        auto const avgBlocksPerGroup
+            = static_cast<double>(mReplicatedMlaOnboardedBlocks) / static_cast<double>(mReplicatedMlaOnboardGroups);
+        TLLM_LOG_DEBUG(
+            "%s - replicated MLA onboarded blocks:      %zu ", mLogPrefix.c_str(), mReplicatedMlaOnboardedBlocks);
+        TLLM_LOG_DEBUG(
+            "%s - replicated MLA NCCL groups:           %zu ", mLogPrefix.c_str(), mReplicatedMlaOnboardGroups);
+        TLLM_LOG_DEBUG("%s - replicated MLA avg blocks/group:   %.2f ", mLogPrefix.c_str(), avgBlocksPerGroup);
+    }
 }
 
 bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize)
@@ -1181,41 +1205,81 @@ void BlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr const& off
     mWindowBlockManagers.at(windowSize).onboardBlock(sequence, offloadBlock, mode, directory);
 }
 
+BlockPtr WindowBlockManager::prepareReplicatedMlaOnboard(
+    GenerationRequest& sequence, BlockPtr const& offloadBlock, executor::KvCacheTransferMode mode,
+    std::string const& directory)
+{
+    validateReplicatedHostOffloadMode(mode);
+    TLLM_CHECK_WITH_INFO(
+        !offloadBlock->isPrimary(), "Replicated TP MLA host offload only prepares offloaded secondary blocks");
+    auto primaryBlock = getFreeBlock(
+        sequence, executor::KvCacheRetentionConfig::kDefaultRetentionPriority, std::nullopt, mode, directory);
+    if (mIsTpLeader)
+    {
+        copyBlockOnBufferStream(mBufferManager, offloadBlock, primaryBlock, mPools, 0);
+    }
+
+    // Update the logical block immediately so later allocations see the same primary/secondary
+    // ownership state as the legacy per-block onboard flow.
+    offloadBlock->swapMemoryPoolBlockOffset(primaryBlock);
+    mEvictionPolicy->releaseBlock(primaryBlock);
+    return offloadBlock;
+}
+
+void WindowBlockManager::flushReplicatedMlaOnboardBatch(
+    std::vector<BlockPtr> const& batch, executor::KvCacheTransferMode mode)
+{
+    if (batch.empty())
+    {
+        return;
+    }
+    validateReplicatedHostOffloadMode(mode);
+#if ENABLE_MULTI_DEVICE
+    broadcastPrimaryBlocksToTpGroup(mBufferManager, batch, mPools, mTpGroupRanks);
+#else
+    TLLM_THROW("Replicated TP MLA host offload requires TensorRT-LLM to be built with multi-device support.");
+#endif
+    if (mEventManager)
+    {
+        for (auto const& block : batch)
+        {
+            mEventManager->enqueueUpdatedEvent(
+                tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
+                mWindowSize);
+        }
+    }
+    mReplicatedMlaOnboardedBlocks += batch.size();
+    ++mReplicatedMlaOnboardGroups;
+    TLLM_LOG_DEBUG("%s - flushed replicated MLA onboard batch with %zu blocks", mLogPrefix.c_str(), batch.size());
+}
+
 void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock,
     executor::KvCacheTransferMode mode, std::string const& directory)
 {
     if (mOnboardBlocks && !offloadBlock->isPrimary())
     {
-        auto block = getFreeBlock(
-            sequence, executor::KvCacheRetentionConfig::kDefaultRetentionPriority, std::nullopt, mode, directory);
         if (mEnableTpMlaReplicatedHostOffload)
         {
-            validateReplicatedHostOffloadMode(mode);
-            if (mIsTpLeader)
-            {
-                copyBlockOnBufferStream(mBufferManager, offloadBlock, block, mPools, 0);
-            }
-#if ENABLE_MULTI_DEVICE
-            broadcastPrimaryBlockToTpGroup(mBufferManager, block, mPools, mTpGroupRanks);
-#else
-            TLLM_THROW("Replicated TP MLA host offload requires TensorRT-LLM to be built with multi-device support.");
-#endif
+            std::vector<BlockPtr> batch{prepareReplicatedMlaOnboard(sequence, offloadBlock, mode, directory)};
+            flushReplicatedMlaOnboardBatch(batch, mode);
         }
         else
         {
+            auto block = getFreeBlock(
+                sequence, executor::KvCacheRetentionConfig::kDefaultRetentionPriority, std::nullopt, mode, directory);
             mTransferManager->onboard(offloadBlock, block, mPools, 0, mode, directory);
-        }
-        // swap linear block offsets (i.e. make block the offload block and vice versa)
-        offloadBlock->swapMemoryPoolBlockOffset(block);
+            // swap linear block offsets (i.e. make block the offload block and vice versa)
+            offloadBlock->swapMemoryPoolBlockOffset(block);
 
-        if (mEventManager)
-        {
-            mEventManager->enqueueUpdatedEvent(
-                tle::KVCacheUpdatedData(offloadBlock->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
-                mWindowSize);
+            if (mEventManager)
+            {
+                mEventManager->enqueueUpdatedEvent(
+                    tle::KVCacheUpdatedData(offloadBlock->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
+                    mWindowSize);
+            }
+            mEvictionPolicy->releaseBlock(block); // append block to offload queue
+                                                  // offloadBlock is now in primary memory pool
         }
-        mEvictionPolicy->releaseBlock(block); // append block to offload queue
-                                              // offloadBlock is now in primary memory pool
     }
 }
 
@@ -1389,6 +1453,27 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     SizeType32 numMatchedTokens{0};
     auto searchRoot = mCachedBlocksRoot;
+    std::vector<BlockPtr> replicatedMlaOnboardBatch;
+    auto flushPendingReplicatedMlaOnboardBatch = [&]()
+    {
+        if (replicatedMlaOnboardBatch.empty())
+        {
+            return;
+        }
+        flushReplicatedMlaOnboardBatch(replicatedMlaOnboardBatch, mode);
+        for (auto& batchBlock : replicatedMlaOnboardBatch)
+        {
+            auto const batchBlockId = batchBlock->getBlockId();
+            addBlockToAllBeams(batchBlock, sequence);
+            ++mReusedBlocks;
+            if (!mReusedBlockIds.count(batchBlockId))
+            {
+                mReusedBlockIds.insert(batchBlockId);
+                ++mReusedUniqueBlocks;
+            }
+        }
+        replicatedMlaOnboardBatch.clear();
+    };
 
     // The last block cannot be shared between beams because it will be written to.
     // Make sure a unique block is allocated per beam.
@@ -1453,19 +1538,35 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                     sequence.getRequestId(), matchingBlockId);
                 searchRoot = matchingBlock;
             }
-            onboardBlock(sequence, matchingBlock, mode, directory);
-            addBlockToAllBeams(matchingBlock, sequence);
-            // TODO: only add once for reused blocks
-            ++mReusedBlocks;
-            if (!mReusedBlockIds.count(matchingBlockId))
+            auto const canBatchReplicatedMlaOnboard
+                = mEnableTpMlaReplicatedHostOffload && !partialMatch && !matchingBlock->isPrimary();
+            if (canBatchReplicatedMlaOnboard)
             {
-                mReusedBlockIds.insert(matchingBlockId);
-                ++mReusedUniqueBlocks;
+                matchingBlock = prepareReplicatedMlaOnboard(sequence, matchingBlock, mode, directory);
+                replicatedMlaOnboardBatch.push_back(matchingBlock);
+                if (replicatedMlaOnboardBatch.size() == kReplicatedMlaOnboardBatchSize)
+                {
+                    flushPendingReplicatedMlaOnboardBatch();
+                }
+            }
+            else
+            {
+                flushPendingReplicatedMlaOnboardBatch();
+                onboardBlock(sequence, matchingBlock, mode, directory);
+                addBlockToAllBeams(matchingBlock, sequence);
+                // TODO: only add once for reused blocks
+                ++mReusedBlocks;
+                if (!mReusedBlockIds.count(matchingBlockId))
+                {
+                    mReusedBlockIds.insert(matchingBlockId);
+                    ++mReusedUniqueBlocks;
+                }
             }
             ++blockItr;
         }
         else // matchingBlock == nullptr || numMatchedTokens + numMatched > sequence.getCurrentPrepopulatedPromptLen()
         {
+            flushPendingReplicatedMlaOnboardBatch();
             // If we haven't set a priority, set it to the default priority level (low)
             auto freeBlock = getFreeBlock(sequence,
                 perBlockRetentions[bi].retentionPriority.value_or(
@@ -1485,6 +1586,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             ++mMissedBlocks;
         }
     }
+
+    flushPendingReplicatedMlaOnboardBatch();
 
     // Allocate new blocks that cannot be shared by multiple beams.
     for (int bi = numSharedContextBlocks; bi < numContextBlocks; ++bi)
@@ -1516,6 +1619,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
         }
     }
 
+    flushPendingReplicatedMlaOnboardBatch();
     return numMatchedTokens;
 }
 

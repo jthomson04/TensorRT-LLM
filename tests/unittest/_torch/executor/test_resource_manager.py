@@ -862,14 +862,6 @@ class TestResourceManager(unittest.TestCase):
 
     def test_kv_cache_manager_passes_tp_mla_replicated_host_offload_kwargs(
             self):
-
-        class MockPretrainedConfig:
-            kv_lora_rank = 128
-            qk_rope_head_dim = 64
-
-        class MockRuntimeModelConfig:
-            pretrained_config = MockPretrainedConfig()
-
         mapping = Mapping(world_size=2, rank=0, tp_size=2)
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.1,
@@ -898,15 +890,14 @@ class TestResourceManager(unittest.TestCase):
                 kv_cache_manager = KVCacheManager(
                     kv_cache_config=kv_cache_config,
                     kv_cache_type=tensorrt_llm.bindings.internal.
-                    batch_manager.CacheType.SELF,
+                    batch_manager.CacheType.SELFKONLY,
                     num_layers=2,
-                    num_kv_heads=2,
+                    num_kv_heads=1,
                     head_dim=128,
                     tokens_per_block=64,
                     max_seq_len=1024,
                     max_batch_size=1,
                     mapping=mapping,
-                    model_config=MockRuntimeModelConfig(),
                     execution_stream=execution_stream,
                 )
 
@@ -918,14 +909,6 @@ class TestResourceManager(unittest.TestCase):
 
     def test_kv_cache_manager_rejects_tp_mla_replicated_host_offload_with_attention_dp(
             self):
-
-        class MockPretrainedConfig:
-            kv_lora_rank = 128
-            qk_rope_head_dim = 64
-
-        class MockRuntimeModelConfig:
-            pretrained_config = MockPretrainedConfig()
-
         mapping = Mapping(world_size=2,
                           rank=0,
                           tp_size=2,
@@ -944,28 +927,20 @@ class TestResourceManager(unittest.TestCase):
                 KVCacheManager(
                     kv_cache_config=kv_cache_config,
                     kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
-                    CacheType.SELF,
+                    CacheType.SELFKONLY,
                     num_layers=2,
-                    num_kv_heads=2,
+                    num_kv_heads=1,
                     head_dim=128,
                     tokens_per_block=64,
                     max_seq_len=1024,
                     max_batch_size=1,
                     mapping=mapping,
-                    model_config=MockRuntimeModelConfig(),
                     execution_stream=type("ExecutionStream", (),
                                           {"cuda_stream": 1234})(),
                 )
 
     def test_kv_cache_manager_rejects_tp_mla_replicated_host_offload_for_non_mla(
             self):
-
-        class MockPretrainedConfig:
-            hidden_size = 1024
-
-        class MockRuntimeModelConfig:
-            pretrained_config = MockPretrainedConfig()
-
         mapping = Mapping(world_size=2, rank=0, tp_size=2)
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.1,
@@ -988,7 +963,6 @@ class TestResourceManager(unittest.TestCase):
                     max_seq_len=1024,
                     max_batch_size=1,
                     mapping=mapping,
-                    model_config=MockRuntimeModelConfig(),
                     execution_stream=type("ExecutionStream", (),
                                           {"cuda_stream": 1234})(),
                 )

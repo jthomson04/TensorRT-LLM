@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -4380,6 +4380,39 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
     for (int i = 0; i < blockSize; i++)
     {
         EXPECT_EQ(tr::bufferCast<float>(*pool.secondaryPtr)[i], 0);
+    }
+}
+
+TEST_F(KVCacheManagerTest, KVCacheTransferManagerReplicatedFollowerOffloadNoOpTest)
+{
+    auto const blockSize = 16384;
+
+    auto bufferManager = tensorrt_llm::runtime::BufferManager(std::make_shared<tr::CudaStream>());
+    auto transferManager = KVCacheTransferManager(
+        bufferManager, nullptr, /* enableTpMlaReplicatedHostOffload = */ true, /* isTpLeader = */ false, {0, 1});
+
+    auto pool = KVCacheBlockPool(0, 2, 0, 0, 0);
+
+    pool.primaryPtr = bufferManager.gpu(tr::ITensor::makeShape({1, blockSize}), nvinfer1::DataType::kFLOAT);
+    bufferManager.setZero(*pool.primaryPtr);
+
+    pool.secondaryPtr = tr::BufferManager::pinned(tr::ITensor::makeShape({1, blockSize}), nvinfer1::DataType::kFLOAT);
+
+    for (int i = 0; i < blockSize; i++)
+    {
+        tr::bufferCast<float>(*pool.secondaryPtr)[i] = 1;
+    }
+
+    auto primaryBlock = std::make_shared<KVCacheBlock>(0, tensorrt_llm::kernels::KVCacheIndex(0, false));
+    auto secondaryBlock = std::make_shared<KVCacheBlock>(1, tensorrt_llm::kernels::KVCacheIndex(0, true));
+
+    transferManager.offload(primaryBlock, secondaryBlock, {pool});
+    transferManager.syncTransfers();
+    bufferManager.getStream().synchronize();
+
+    for (int i = 0; i < blockSize; i++)
+    {
+        EXPECT_EQ(tr::bufferCast<float>(*pool.secondaryPtr)[i], 1);
     }
 }
 

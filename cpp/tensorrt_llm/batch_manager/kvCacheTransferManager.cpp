@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/kvCachePartialCopy.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -34,6 +35,17 @@ namespace kvc = tensorrt_llm::executor::kv_cache;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+
+namespace
+{
+
+void validateReplicatedHostOffloadMode(executor::KvCacheTransferMode mode)
+{
+    TLLM_CHECK_WITH_INFO(mode == executor::KvCacheTransferMode::DRAM,
+        "Replicated TP MLA host offload only supports DRAM transfer mode, got %d", static_cast<int>(mode));
+}
+
+} // namespace
 
 static bool gpuToFilePosix(tr::ITensor::SharedPtr const& srcPtr, std::string const& filename)
 {
@@ -76,25 +88,111 @@ static bool fileToGpuPosix(tr::ITensor::SharedPtr const& dstPtr, std::string con
 }
 
 KVCacheTransferManager::KVCacheTransferManager(
-    tr::BufferManager const& bufferManager, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent)
+    tr::BufferManager const& bufferManager, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent,
+    bool enableTpMlaReplicatedHostOffload, bool isTpLeader, std::set<int> tpGroupRanks)
     : mBufferManager{bufferManager}
     , mOnboardManager(std::make_shared<tr::CudaStream>())
     , mOffloadManager(std::make_shared<tr::CudaStream>())
+    , mBroadcastStream(enableTpMlaReplicatedHostOffload ? std::make_shared<tr::CudaStream>() : nullptr)
+    , mEnableTpMlaReplicatedHostOffload{enableTpMlaReplicatedHostOffload}
+    , mIsTpLeader{isTpLeader}
+    , mTpGroupRanks{std::move(tpGroupRanks)}
     , mLoopbackAgent{loopbackAgent}
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
 }
 
+std::size_t KVCacheTransferManager::PendingTransferKeyHash::operator()(PendingTransferKey const& key) const
+{
+    auto const offset = static_cast<std::uint32_t>(key.offset);
+    auto const encoded = (static_cast<std::uint64_t>(offset) << 1U) | static_cast<std::uint64_t>(key.isPrimary);
+    return std::hash<std::uint64_t>{}(encoded);
+}
+
 tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
     BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx)
 {
-    TLLM_CHECK_WITH_INFO(!pools.empty(), "Pool index %lu is out of bounds", poolIdx);
+    TLLM_CHECK_WITH_INFO(poolIdx < pools.size(), "Pool index %lu is out of bounds", poolIdx);
     auto const& pool = pools.at(poolIdx);
     auto ptr = block->isPrimary() ? pool.primaryPtr : pool.secondaryPtr;
     auto const blockOffset = block->getMemoryPoolBlockIndex();
     tr::ITensor::SharedPtr blockTensor{tr::ITensor::slice(ptr, blockOffset, 1)};
     return blockTensor;
+}
+
+KVCacheTransferManager::PendingTransferKey KVCacheTransferManager::computePendingTransferKey(BlockPtr const& block)
+{
+    return PendingTransferKey{block->getMemoryPoolBlockIndex(), block->isPrimary()};
+}
+
+void KVCacheTransferManager::waitForPendingRead(
+    PendingTransferKey const& key, tr::CudaStream const& stream, bool eraseAfterWait)
+{
+    auto pendingReadItr = mPendingReads.find(key);
+    if (pendingReadItr != mPendingReads.end())
+    {
+        stream.wait(pendingReadItr->second);
+        if (eraseAfterWait)
+        {
+            mPendingReads.erase(pendingReadItr);
+        }
+    }
+}
+
+void KVCacheTransferManager::waitForPendingWrite(
+    PendingTransferKey const& key, tr::CudaStream const& stream, bool eraseAfterWait)
+{
+    auto pendingWriteItr = mPendingWrites.find(key);
+    if (pendingWriteItr != mPendingWrites.end())
+    {
+        stream.wait(pendingWriteItr->second);
+        if (eraseAfterWait)
+        {
+            mPendingWrites.erase(pendingWriteItr);
+        }
+    }
+}
+
+void KVCacheTransferManager::recordPendingRead(PendingTransferKey const& key, tr::CudaStream const& stream)
+{
+    mPendingReads[key] = tr::CudaEvent();
+    stream.record(mPendingReads[key]);
+}
+
+void KVCacheTransferManager::recordPendingWrite(PendingTransferKey const& key, tr::CudaStream const& stream)
+{
+    mPendingWrites[key] = tr::CudaEvent();
+    stream.record(mPendingWrites[key]);
+}
+
+void KVCacheTransferManager::broadcastBlock(BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools)
+{
+    TLLM_CHECK_WITH_INFO(mEnableTpMlaReplicatedHostOffload,
+        "broadcastBlock is only valid when replicated TP MLA host offload is enabled.");
+    TLLM_CHECK_WITH_INFO(block->isPrimary(), "Replicated TP MLA host offload only broadcasts primary blocks.");
+    TLLM_CHECK_WITH_INFO(mBroadcastStream != nullptr, "Missing NCCL broadcast stream for replicated TP MLA host offload.");
+
+#if ENABLE_MULTI_DEVICE
+    TLLM_CHECK_WITH_INFO(mTpGroupRanks.size() > 1, "Replicated TP MLA host offload requires tp_size > 1.");
+    auto ncclComm = ::tensorrt_llm::getComm(mTpGroupRanks);
+    auto* dtypeMap = ::tensorrt_llm::getDtypeMap();
+    auto const stream = mBroadcastStream->get();
+
+    NCCLCHECK_THROW(ncclGroupStart());
+    for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
+    {
+        auto blockPtr = computeBlockPointer(block, pools, poolIdx);
+        auto const dtype = blockPtr->getDataType();
+        auto const dtypeIt = dtypeMap->find(dtype);
+        TLLM_CHECK_WITH_INFO(dtypeIt != dtypeMap->end(), "Unsupported NCCL broadcast dtype %d", static_cast<int>(dtype));
+        NCCLCHECK_THROW(ncclBroadcast(
+            blockPtr->data(), blockPtr->data(), blockPtr->getSize(), dtypeIt->second, 0, *ncclComm, stream));
+    }
+    NCCLCHECK_THROW(ncclGroupEnd());
+#else
+    TLLM_THROW("Replicated TP MLA host offload requires TensorRT-LLM to be built with multi-device support.");
+#endif
 }
 
 void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
@@ -212,12 +310,12 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 }
 
 //
-// Note about recording events to wait for cudaMempyAsync calls between blocks:
-// The memory copy involves raw memory blocks, which are pointed to by the
-// memory pool block index. When recording events, you must use getMemoryPoolBlockIndex()
-// as the raw memory block identifier. Using getBlockId() when recording events is wrong.
-// getBlockId() returns the logical block id, which has nothing to do with the raw memory
-// block pointers involved in a cudaMemcpy.
+// Note about recording events to wait for cudaMemcpyAsync calls between blocks:
+// The memory copy involves raw memory slots, which are identified by the
+// memory pool block index plus the primary/secondary memory level. Using
+// getBlockId() when recording events is wrong. getBlockId() returns the
+// logical block id, which has nothing to do with the raw memory block
+// pointers involved in a cudaMemcpy.
 //
 
 //
@@ -249,85 +347,87 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
-    // Wait for any pending writes before reading from offloadedBlock
-    auto offloadedBlockPendingWriteItr = mPendingWrites.find(offloadedBlock->getMemoryPoolBlockIndex());
-    if (offloadedBlockPendingWriteItr != mPendingWrites.end())
+    auto const sourceKey = computePendingTransferKey(offloadedBlock);
+    auto const destinationKey = computePendingTransferKey(block);
+
+    if (mEnableTpMlaReplicatedHostOffload)
     {
-        mOnboardManager.getStream().wait(offloadedBlockPendingWriteItr->second);
-        // Don't erase, we are not changing state of offloadedBlock
+        validateReplicatedHostOffloadMode(mode);
+        TLLM_CHECK_WITH_INFO(mBroadcastStream != nullptr,
+            "Missing NCCL broadcast stream for replicated TP MLA host offload.");
+
+        if (mIsTpLeader)
+        {
+            waitForPendingWrite(sourceKey, mOnboardManager.getStream(), false);
+            waitForPendingRead(destinationKey, mOnboardManager.getStream(), true);
+            waitForPendingWrite(destinationKey, mOnboardManager.getStream(), true);
+
+            copyBlock(offloadedBlock, block, pools, false, numTokensToCopy, mode, directory);
+
+            tr::CudaEvent copyDone;
+            mOnboardManager.getStream().record(copyDone);
+            recordPendingRead(sourceKey, mOnboardManager.getStream());
+            mBroadcastStream->wait(copyDone);
+        }
+        else
+        {
+            waitForPendingRead(destinationKey, *mBroadcastStream, true);
+            waitForPendingWrite(destinationKey, *mBroadcastStream, true);
+        }
+
+        broadcastBlock(block, pools);
+        recordPendingWrite(destinationKey, *mBroadcastStream);
+        return;
     }
-    // Wait for any pending reads before overwriting block
-    auto blockPendingReadItr = mPendingReads.find(block->getMemoryPoolBlockIndex());
-    if (blockPendingReadItr != mPendingReads.end())
-    {
-        mOnboardManager.getStream().wait(blockPendingReadItr->second);
-        mPendingReads.erase(blockPendingReadItr);
-    }
-    // Wait for any pending writes before overwriting block
-    auto blockPendingWriteItr = mPendingWrites.find(block->getMemoryPoolBlockIndex());
-    if (blockPendingWriteItr != mPendingWrites.end())
-    {
-        mOnboardManager.getStream().wait(blockPendingWriteItr->second);
-        mPendingWrites.erase(blockPendingWriteItr);
-    }
+
+    waitForPendingWrite(sourceKey, mOnboardManager.getStream(), false);
+    waitForPendingRead(destinationKey, mOnboardManager.getStream(), true);
+    waitForPendingWrite(destinationKey, mOnboardManager.getStream(), true);
 
     copyBlock(offloadedBlock, block, pools, false, numTokensToCopy, mode, directory);
 
-    // Record new pending read from offloadedBlock
-    mPendingReads[offloadedBlock->getMemoryPoolBlockIndex()] = tr::CudaEvent();
-    mOnboardManager.getStream().record(mPendingReads[offloadedBlock->getMemoryPoolBlockIndex()]);
-    // Record new pending write to block
-    mPendingWrites[block->getMemoryPoolBlockIndex()] = tr::CudaEvent();
-    mOnboardManager.getStream().record(mPendingWrites[block->getMemoryPoolBlockIndex()]);
+    recordPendingRead(sourceKey, mOnboardManager.getStream());
+    recordPendingWrite(destinationKey, mOnboardManager.getStream());
 }
 
 void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offloadBlock,
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
-    // Wait for any pending writes before reading from block
-    auto blockPendingWriteItr = mPendingWrites.find(block->getMemoryPoolBlockIndex());
-    if (blockPendingWriteItr != mPendingWrites.end())
+    auto const sourceKey = computePendingTransferKey(block);
+    auto const destinationKey = computePendingTransferKey(offloadBlock);
+
+    if (mEnableTpMlaReplicatedHostOffload)
     {
-        mOffloadManager.getStream().wait(blockPendingWriteItr->second);
-        // Don't erase, we are not changing state of block
+        validateReplicatedHostOffloadMode(mode);
+        if (!mIsTpLeader)
+        {
+            return;
+        }
     }
-    // Wait for any pending reads before overwriting offloadBlock
-    auto offloadBlockPendingReadItr = mPendingReads.find(offloadBlock->getMemoryPoolBlockIndex());
-    if (offloadBlockPendingReadItr != mPendingReads.end())
-    {
-        mOffloadManager.getStream().wait(offloadBlockPendingReadItr->second);
-        mPendingReads.erase(offloadBlockPendingReadItr);
-    }
-    // Wait for any pending writes before overwriting offloadBlock
-    auto offloadBlockPendingWriteItr = mPendingWrites.find(offloadBlock->getMemoryPoolBlockIndex());
-    if (offloadBlockPendingWriteItr != mPendingWrites.end())
-    {
-        mOffloadManager.getStream().wait(offloadBlockPendingWriteItr->second);
-        mPendingWrites.erase(offloadBlockPendingWriteItr);
-    }
+
+    waitForPendingWrite(sourceKey, mOffloadManager.getStream(), false);
+    waitForPendingRead(destinationKey, mOffloadManager.getStream(), true);
+    waitForPendingWrite(destinationKey, mOffloadManager.getStream(), true);
 
     copyBlock(block, offloadBlock, pools, true, numTokensToCopy, mode, directory);
 
-    // Record new pending read from block
-    mPendingReads[block->getMemoryPoolBlockIndex()] = tr::CudaEvent();
-    mOffloadManager.getStream().record(mPendingReads[block->getMemoryPoolBlockIndex()]);
-    // Record new pending write to offloadBlock
-    mPendingWrites[offloadBlock->getMemoryPoolBlockIndex()] = tr::CudaEvent();
-    mOffloadManager.getStream().record(mPendingWrites[offloadBlock->getMemoryPoolBlockIndex()]);
+    recordPendingRead(sourceKey, mOffloadManager.getStream());
+    recordPendingWrite(destinationKey, mOffloadManager.getStream());
 }
 
 void KVCacheTransferManager::syncWithBufferManager()
 {
-    tr::CudaEvent readyForOffloadEvent;
-    mBufferManager.getStream().record(readyForOffloadEvent);
-    mOffloadManager.getStream().wait(readyForOffloadEvent);
+    tr::CudaEvent readyForTransfersEvent;
+    mBufferManager.getStream().record(readyForTransfersEvent);
+    mOffloadManager.getStream().wait(readyForTransfersEvent);
+    mOnboardManager.getStream().wait(readyForTransfersEvent);
+    if (mBroadcastStream != nullptr)
+    {
+        mBroadcastStream->wait(readyForTransfersEvent);
+    }
 
-    tr::CudaEvent readyForOnboardEvent;
-    mBufferManager.getStream().record(readyForOnboardEvent);
-    mOnboardManager.getStream().wait(readyForOnboardEvent);
-
-    // Once we synchronize, clear our list of pending thransfers.
+    // Once we synchronize, clear our list of pending transfers.
     mPendingReads.clear();
     mPendingWrites.clear();
 }
@@ -342,7 +442,14 @@ void KVCacheTransferManager::syncTransfers()
     mOnboardManager.getStream().record(onboardEvent);
     mBufferManager.getStream().wait(onboardEvent);
 
-    // Once we synchronize, clear our list of pending thransfers.
+    if (mBroadcastStream != nullptr)
+    {
+        tr::CudaEvent broadcastEvent;
+        mBroadcastStream->record(broadcastEvent);
+        mBufferManager.getStream().wait(broadcastEvent);
+    }
+
+    // Once we synchronize, clear our list of pending transfers.
     mPendingReads.clear();
     mPendingWrites.clear();
 }

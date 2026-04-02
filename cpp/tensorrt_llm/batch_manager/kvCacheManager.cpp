@@ -87,57 +87,11 @@ std::vector<BlockPtr> getAllSequenceBlocks(BlockPtr lastBlock)
     return sequenceBlocks;
 }
 
-ITensor::SharedPtr getBlockPoolPointer(
-    BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx)
-{
-    TLLM_CHECK_WITH_INFO(poolIdx < pools.size(), "Pool index %lu is out of bounds", poolIdx);
-    auto const& pool = pools.at(poolIdx);
-    auto ptr = block->isPrimary() ? pool.primaryPtr : pool.secondaryPtr;
-    TLLM_CHECK_WITH_INFO(ptr != nullptr, "Missing memory backing for block %d in pool %lu", block->getBlockId(), poolIdx);
-    return ITensor::slice(ptr, block->getMemoryPoolBlockIndex(), 1);
-}
-
-void copyBlockOnBufferStream(BufferManager const& bufferManager, BlockPtr const& src, BlockPtr const& dst,
-    std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy)
-{
-    TLLM_CHECK_WITH_INFO(
-        numTokensToCopy == 0, "Replicated TP MLA host offload does not support partial block copies");
-    for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
-    {
-        auto srcPtr = getBlockPoolPointer(src, pools, poolIdx);
-        auto dstPtr = getBlockPoolPointer(dst, pools, poolIdx);
-        bufferManager.copy(*srcPtr, *dstPtr);
-    }
-}
-
 void validateReplicatedHostOffloadMode(tle::KvCacheTransferMode mode)
 {
     TLLM_CHECK_WITH_INFO(mode == tle::KvCacheTransferMode::DRAM,
         "Replicated TP MLA host offload only supports DRAM transfer mode, got %d", static_cast<int>(mode));
 }
-
-#if ENABLE_MULTI_DEVICE
-void broadcastPrimaryBlockToTpGroup(BufferManager const& bufferManager, BlockPtr const& block,
-    std::vector<KVCacheBlockPool> const& pools, std::set<int> const& tpGroupRanks)
-{
-    TLLM_CHECK_WITH_INFO(tpGroupRanks.size() > 1, "Replicated TP MLA host offload requires tp_size > 1");
-    auto ncclComm = ::tensorrt_llm::getComm(tpGroupRanks);
-    auto* dtypeMap = ::tensorrt_llm::getDtypeMap();
-    auto const stream = bufferManager.getStream().get();
-
-    NCCLCHECK_THROW(ncclGroupStart());
-    for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
-    {
-        auto blockPtr = getBlockPoolPointer(block, pools, poolIdx);
-        auto const dtype = blockPtr->getDataType();
-        auto const dtypeIt = dtypeMap->find(dtype);
-        TLLM_CHECK_WITH_INFO(dtypeIt != dtypeMap->end(), "Unsupported NCCL broadcast dtype %d", static_cast<int>(dtype));
-        NCCLCHECK_THROW(ncclBroadcast(
-            blockPtr->data(), blockPtr->data(), blockPtr->getSize(), dtypeIt->second, 0, *ncclComm, stream));
-    }
-    NCCLCHECK_THROW(ncclGroupEnd());
-}
-#endif // ENABLE_MULTI_DEVICE
 
 } // namespace
 
@@ -719,7 +673,6 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mCacheType{cacheType}
     , mEventManager(std::move(eventManager))
     , mLoopbackAgent{loopbackAgent}
-    , mTransferManager{std::make_shared<KVCacheTransferManager>(mBufferManager, mLoopbackAgent)}
     , mAllocTotalBlocks{0}
     , mAllocNewBlocks{0}
     , mReusedBlocks{0}
@@ -764,6 +717,9 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
         TLLM_THROW("Replicated TP MLA host offload requires TensorRT-LLM to be built with multi-device support.");
 #endif
     }
+
+    mTransferManager = std::make_shared<KVCacheTransferManager>(mBufferManager, mLoopbackAgent,
+        mEnableTpMlaReplicatedHostOffload, mIsTpLeader, mTpGroupRanks);
 
     std::map<SizeType32, SizeType32> numLayersPerPool;
 
@@ -1083,15 +1039,8 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         if (mEnableTpMlaReplicatedHostOffload)
         {
             validateReplicatedHostOffloadMode(mode);
-            if (mIsTpLeader)
-            {
-                copyBlockOnBufferStream(mBufferManager, block, offloadBlock, mPools, 0);
-            }
         }
-        else
-        {
-            mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
-        }
+        mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
 
@@ -1189,20 +1138,8 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
         if (mEnableTpMlaReplicatedHostOffload)
         {
             validateReplicatedHostOffloadMode(mode);
-            if (mIsTpLeader)
-            {
-                copyBlockOnBufferStream(mBufferManager, offloadBlock, block, mPools, 0);
-            }
-#if ENABLE_MULTI_DEVICE
-            broadcastPrimaryBlockToTpGroup(mBufferManager, block, mPools, mTpGroupRanks);
-#else
-            TLLM_THROW("Replicated TP MLA host offload requires TensorRT-LLM to be built with multi-device support.");
-#endif
         }
-        else
-        {
-            mTransferManager->onboard(offloadBlock, block, mPools, 0, mode, directory);
-        }
+        mTransferManager->onboard(offloadBlock, block, mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block and vice versa)
         offloadBlock->swapMemoryPoolBlockOffset(block);
 
@@ -1241,15 +1178,8 @@ void WindowBlockManager::offloadBlock(
         if (mEnableTpMlaReplicatedHostOffload)
         {
             validateReplicatedHostOffloadMode(mode);
-            if (mIsTpLeader)
-            {
-                copyBlockOnBufferStream(mBufferManager, block, offloadBlock, mPools, 0);
-            }
         }
-        else
-        {
-            mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
-        }
+        mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
 

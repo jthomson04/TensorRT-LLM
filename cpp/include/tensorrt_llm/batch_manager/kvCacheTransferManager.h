@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,9 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 
+#include <functional>
+#include <set>
+
 namespace tr = tensorrt_llm::runtime;
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
@@ -34,7 +37,8 @@ class KVCacheTransferManager
 {
 public:
     explicit KVCacheTransferManager(
-        tr::BufferManager const& bufferManager, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr);
+        tr::BufferManager const& bufferManager, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr,
+        bool enableTpMlaReplicatedHostOffload = false, bool isTpLeader = true, std::set<int> tpGroupRanks = {});
 
     //! \brief Onboard a block to gpu memory.
     void onboard(BlockPtr const& offloadBlock, BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools,
@@ -58,9 +62,27 @@ public:
     void syncTransfers();
 
 private:
+    struct PendingTransferKey
+    {
+        kernels::KVCacheIndex::UnderlyingType offset;
+        bool isPrimary;
+
+        friend bool operator==(PendingTransferKey const& lhs, PendingTransferKey const& rhs)
+        {
+            return lhs.offset == rhs.offset && lhs.isPrimary == rhs.isPrimary;
+        }
+    };
+
+    struct PendingTransferKeyHash
+    {
+        [[nodiscard]] std::size_t operator()(PendingTransferKey const& key) const;
+    };
+
     //! \brief Get pointer to pool specified by cache block.
     static tr::ITensor::SharedPtr computeBlockPointer(
         BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx);
+
+    [[nodiscard]] static PendingTransferKey computePendingTransferKey(BlockPtr const& block);
 
     /*!
      * \brief The key method that copies the src block to the dst block.
@@ -79,14 +101,28 @@ private:
         int numTokensToCopy = 0, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
         std::string const& directory = "");
 
+    void broadcastBlock(BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools);
+
+    void waitForPendingRead(PendingTransferKey const& key, tr::CudaStream const& stream, bool eraseAfterWait);
+
+    void waitForPendingWrite(PendingTransferKey const& key, tr::CudaStream const& stream, bool eraseAfterWait);
+
+    void recordPendingRead(PendingTransferKey const& key, tr::CudaStream const& stream);
+
+    void recordPendingWrite(PendingTransferKey const& key, tr::CudaStream const& stream);
+
     runtime::BufferManager mBufferManager;
     runtime::BufferManager mOnboardManager;
     runtime::BufferManager mOffloadManager;
+    std::shared_ptr<tr::CudaStream> mBroadcastStream;
 
-    // Track reads and writes for blocks. Note that it is the memory pool index that
-    // identifies the raw memory blocks involved in I/O, not the block Id.
-    std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingReads;
-    std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingWrites;
+    // Track reads and writes for blocks. The key identifies a raw memory slot
+    // by both offset and memory level so primary and secondary slots do not alias.
+    std::unordered_map<PendingTransferKey, tr::CudaEvent, PendingTransferKeyHash> mPendingReads;
+    std::unordered_map<PendingTransferKey, tr::CudaEvent, PendingTransferKeyHash> mPendingWrites;
+    bool mEnableTpMlaReplicatedHostOffload;
+    bool mIsTpLeader;
+    std::set<int> mTpGroupRanks;
     // Reference to parent loopback agent
     std::shared_ptr<kvc::BaseLoopbackAgent> mLoopbackAgent;
     int mDeviceId;
